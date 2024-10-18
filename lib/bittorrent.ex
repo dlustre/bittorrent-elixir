@@ -26,8 +26,9 @@ defmodule Bencode do
 
   def decode(_), do: "Invalid encoded value: not binary"
 
-  def parse([?l | _] = list), do: parse_list(list)
-  def parse([?i | _] = int), do: parse_int(int)
+  def parse([?d | dict]), do: parse_dict(dict, Map.new())
+  def parse([?l | list]), do: parse_list(list, [])
+  def parse([?i | int]), do: parse_int(int, [])
   def parse(string), do: parse_string(string, [])
 
   def parse_string([?: | rest], acc),
@@ -52,15 +53,21 @@ defmodule Bencode do
   #   end
   # end
 
-  def parse_int([?i | rest]), do: parse_int(rest, [])
   def parse_int([?e | rest], acc), do: {rest, acc |> Enum.reverse() |> List.to_integer()}
   def parse_int([character | rest], acc), do: parse_int(rest, [character | acc])
 
-  def parse_list([?l | rest]), do: parse_list(rest, [])
   def parse_list([?e | rest], acc), do: {rest, acc |> Enum.reverse()}
 
   def parse_list(list, acc) do
     {rest, result} = parse(list)
     parse_list(rest, [result | acc])
+  end
+
+  def parse_dict([?e | rest], map), do: {rest, map}
+
+  def parse_dict(dict, map) do
+    {rest, key} = parse_string(dict, [])
+    {rest, value} = parse(rest)
+    parse_dict(rest, map |> Map.put(key, value))
   end
 end
