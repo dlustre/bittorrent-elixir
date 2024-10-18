@@ -1,9 +1,24 @@
+# defmodule TorrentFile do
+#   defstruct [:announce, :info]
+# end
+
+# defmodule TorrentFileInfo do
+#   defstruct [:length, :name, :piece_length, :pieces]
+# end
+
 defmodule Bittorrent.CLI do
   def main(argv) do
     case argv do
       ["decode" | [encoded_str | _]] ->
         decoded_str = Bencode.decode(encoded_str)
         IO.puts(Jason.encode!(decoded_str))
+
+      ["info" | [file_name | _]] ->
+        content = File.read!(file_name)
+        file_map = Bencode.decode(content)
+
+        IO.puts("Tracker URL: #{file_map["announce"]}")
+        IO.puts("Length: #{file_map["info"]["length"]}")
 
       [command | _] ->
         IO.puts("Unknown command: #{command}")
