@@ -10,11 +10,19 @@ defmodule Bittorrent.CLI do
         file_meta = Bencode.decode(content)
 
         bencoded_info = Bencode.encode(file_meta["info"])
+        # IO.inspect(file_meta["info"]["pieces"])
+        <<first::size(20)-unit(8)-binary, _::binary>> = file_meta["info"]["pieces"]
+
+        IO.inspect(first |> binary_to_hex())
+        IO.inspect(byte_size(first))
+
         # IO.inspect(hash_sha1(bencoded_info))
         # Bencode.decode(bencoded_info) |> IO.inspect(label: "decoded:")
         IO.puts("Tracker URL: #{file_meta["announce"]}")
         IO.puts("Length: #{file_meta["info"]["length"]}")
-        IO.puts("Info Hash: #{hash_sha1(bencoded_info)}")
+        IO.puts("Info Hash: #{bencoded_info |> hash_sha1() |> binary_to_hex()}")
+        IO.puts("Piece Length: #{file_meta["info"]["piece length"]}")
+        IO.puts("Piece Hashes:\n#{pieces_to_hashes(file_meta["info"]["pieces"], [])}")
 
       [command | _] ->
         IO.puts("Unknown command: #{command}")
@@ -26,7 +34,12 @@ defmodule Bittorrent.CLI do
     end
   end
 
-  defp hash_sha1(data), do: :crypto.hash(:sha, data) |> Base.encode16(case: :lower)
+  defp hash_sha1(data), do: :crypto.hash(:sha, data)
+  defp binary_to_hex(binary), do: Base.encode16(binary, case: :lower)
+  defp pieces_to_hashes(<<>>, acc), do: acc |> Enum.reverse() |> Enum.join("\n")
+
+  defp pieces_to_hashes(<<piece::20-unit(8)-binary, rest::binary>>, acc),
+    do: pieces_to_hashes(rest, [binary_to_hex(piece) | acc])
 end
 
 defmodule Bencode do
