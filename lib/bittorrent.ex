@@ -1,11 +1,3 @@
-# defmodule TorrentFile do
-#   defstruct [:announce, :info]
-# end
-
-# defmodule TorrentFileInfo do
-#   defstruct [:length, :name, :piece_length, :pieces]
-# end
-
 defmodule Bittorrent.CLI do
   def main(argv) do
     case argv do
@@ -15,10 +7,14 @@ defmodule Bittorrent.CLI do
 
       ["info" | [file_name | _]] ->
         content = File.read!(file_name)
-        file_map = Bencode.decode(content)
+        file_meta = Bencode.decode(content)
 
-        IO.puts("Tracker URL: #{file_map["announce"]}")
-        IO.puts("Length: #{file_map["info"]["length"]}")
+        bencoded_info = Bencode.encode(file_meta["info"])
+        # IO.inspect(hash_sha1(bencoded_info))
+        # Bencode.decode(bencoded_info) |> IO.inspect(label: "decoded:")
+        IO.puts("Tracker URL: #{file_meta["announce"]}")
+        IO.puts("Length: #{file_meta["info"]["length"]}")
+        IO.puts("Info Hash: #{hash_sha1(bencoded_info)}")
 
       [command | _] ->
         IO.puts("Unknown command: #{command}")
@@ -29,60 +25,96 @@ defmodule Bittorrent.CLI do
         System.halt(1)
     end
   end
+
+  defp hash_sha1(data), do: :crypto.hash(:sha, data) |> Base.encode16(case: :lower)
 end
 
 defmodule Bencode do
-  def decode(encoded_value) when is_binary(encoded_value) do
-    binary_data = :binary.bin_to_list(encoded_value)
+  def encode(dict) when is_map(dict) do
+    encoded_dict =
+      dict
+      |> Map.to_list()
+      |> Enum.sort()
+      |> Enum.map(fn {key, value} -> encode(key) <> encode(value) end)
+      # |> IO.inspect(label: "after map")
+      |> Enum.join()
 
-    {_, result} = parse(binary_data)
+    "d" <> encoded_dict <> "e"
+  end
+
+  def encode(list) when is_list(list) do
+    encoded = Enum.map(list, &encode/1) |> Enum.join()
+    "l#{encoded}e"
+  end
+
+  def encode(int) when is_integer(int), do: "i#{int}e"
+
+  def encode(string) when is_binary(string),
+    do: "#{byte_size(string)}:" <> string
+
+  def decode(encoded_value) when is_binary(encoded_value) do
+    {result, _} = parse(encoded_value)
     result
   end
 
   def decode(_), do: "Invalid encoded value: not binary"
 
-  def parse([?d | dict]), do: parse_dict(dict, Map.new())
-  def parse([?l | list]), do: parse_list(list, [])
-  def parse([?i | int]), do: parse_int(int, [])
-  def parse(string), do: parse_string(string, [])
+  def parse(<<?d, dict::binary>>),
+    do:
+      dict
+      # |> IO.inspect(label: "dict")
+      |> parse_dict(%{})
 
-  def parse_string([?: | rest], acc),
-    do: parse_string_value(rest, acc |> Enum.reverse() |> List.to_integer(), [])
+  def parse(<<?l, list::binary>>),
+    do:
+      list
+      # |> IO.inspect(label: "list")
+      |> parse_list([])
 
-  def parse_string([character | rest], acc), do: parse_string(rest, [character | acc])
+  def parse(<<?i, int::binary>>),
+    do:
+      int
+      # |> IO.inspect(label: "int")
+      |> parse_int([])
 
-  def parse_string_value(content, 0, acc),
-    do: {content, acc |> Enum.reverse() |> List.to_string()}
+  def parse(string) when is_binary(string) do
+    if :binary.match(string, <<?:>>) == :nomatch,
+      do: raise("Expected ':' in string in #{string}")
 
-  def parse_string_value([character | rest], length, acc),
-    do: parse_string_value(rest, length - 1, [character | acc])
+    [length_str, string] = :binary.split(string, ":")
+    size = String.to_integer(length_str)
+    <<string::size(size)-unit(8)-binary, rest::binary>> = string
 
-  # def parse_string(string) do
-  #   case Enum.find_index(string, fn char -> char == ?: end) do
-  #     nil ->
-  #       IO.puts("The ':' character is not found in the binary")
+    {string, rest}
+    # |> IO.inspect(label: "Parsed string and rest")
+  end
 
-  #     index ->
-  #       rest = Enum.slice(string, (index + 1)..-1)
-  #       List.to_string(rest)
-  #   end
-  # end
+  def parse_int(<<?e, rest::binary>>, acc), do: {acc |> Enum.reverse() |> List.to_integer(), rest}
+  def parse_int(<<character, rest::binary>>, acc), do: parse_int(rest, [character | acc])
 
-  def parse_int([?e | rest], acc), do: {rest, acc |> Enum.reverse() |> List.to_integer()}
-  def parse_int([character | rest], acc), do: parse_int(rest, [character | acc])
-
-  def parse_list([?e | rest], acc), do: {rest, acc |> Enum.reverse()}
+  def parse_list(<<?e, rest::binary>>, acc), do: {acc |> Enum.reverse(), rest}
 
   def parse_list(list, acc) do
-    {rest, result} = parse(list)
+    {result, rest} = parse(list)
     parse_list(rest, [result | acc])
   end
 
-  def parse_dict([?e | rest], map), do: {rest, map}
+  def parse_dict(<<?e, rest::binary>>, map), do: {map, rest}
 
   def parse_dict(dict, map) do
-    {rest, key} = parse_string(dict, [])
-    {rest, value} = parse(rest)
+    {key, rest} =
+      dict
+      # |> IO.inspect(label: "Parsing as key")
+      |> parse()
+
+    {value, rest} =
+      rest
+      # |> IO.inspect(label: "Parsing as value")
+      |> parse()
+
+    # IO.puts("Finished kv pair.")
+    if byte_size(rest) == 0, do: raise("Unexpected 0 bytes during dict parsing.")
+
     parse_dict(rest, map |> Map.put(key, value))
   end
 end
