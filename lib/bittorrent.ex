@@ -6,23 +6,49 @@ defmodule Bittorrent.CLI do
         IO.puts(Jason.encode!(decoded_str))
 
       ["info" | [file_name | _]] ->
-        content = File.read!(file_name)
-        file_meta = Bencode.decode(content)
+        metainfo = file_to_metainfo(file_name)
 
-        bencoded_info = Bencode.encode(file_meta["info"])
-        # IO.inspect(file_meta["info"]["pieces"])
-        <<first::size(20)-unit(8)-binary, _::binary>> = file_meta["info"]["pieces"]
+        info_hash =
+          metainfo["info"]
+          |> Bencode.encode()
+          |> hash_sha1()
+
+        <<first::size(20)-unit(8)-binary, _::binary>> = metainfo["info"]["pieces"]
 
         IO.inspect(first |> binary_to_hex())
         IO.inspect(byte_size(first))
 
-        # IO.inspect(hash_sha1(bencoded_info))
-        # Bencode.decode(bencoded_info) |> IO.inspect(label: "decoded:")
-        IO.puts("Tracker URL: #{file_meta["announce"]}")
-        IO.puts("Length: #{file_meta["info"]["length"]}")
-        IO.puts("Info Hash: #{bencoded_info |> hash_sha1() |> binary_to_hex()}")
-        IO.puts("Piece Length: #{file_meta["info"]["piece length"]}")
-        IO.puts("Piece Hashes:\n#{pieces_to_hashes(file_meta["info"]["pieces"], [])}")
+        IO.puts("Tracker URL: #{metainfo["announce"]}")
+        IO.puts("Length: #{metainfo["info"]["length"]}")
+        IO.puts("Info Hash: #{info_hash |> binary_to_hex()}")
+        IO.puts("Piece Length: #{metainfo["info"]["piece length"]}")
+        IO.puts("Piece Hashes:\n#{pieces_to_hashes(metainfo["info"]["pieces"], [])}")
+
+      ["peers" | [file_name | _]] ->
+        metainfo = file_to_metainfo(file_name)
+
+        info_hash =
+          metainfo["info"]
+          |> Bencode.encode()
+          |> hash_sha1()
+
+        body =
+          Req.get!(metainfo["announce"],
+            params: [
+              info_hash: info_hash,
+              peer_id: "definitely_a_peer_id",
+              port: 6881,
+              uploaded: 0,
+              downloaded: 0,
+              left: metainfo["info"]["length"],
+              compact: 1
+            ]
+          ).body
+
+        decoded_body = Bencode.decode(body)
+
+        parse_peers(decoded_body["peers"], [])
+        |> Enum.map(&IO.puts/1)
 
       [command | _] ->
         IO.puts("Unknown command: #{command}")
@@ -34,6 +60,16 @@ defmodule Bittorrent.CLI do
     end
   end
 
+  defp parse_peers(<<>>, acc), do: acc
+
+  defp parse_peers(<<a::8, b::8, c::8, d::8, port::16, rest::binary>>, acc),
+    do:
+      parse_peers(
+        rest,
+        [([a, b, c, d] |> Enum.join(".")) <> ":#{port}" | acc]
+      )
+
+  defp file_to_metainfo(path), do: File.read!(path) |> Bencode.decode()
   defp hash_sha1(data), do: :crypto.hash(:sha, data)
   defp binary_to_hex(binary), do: Base.encode16(binary, case: :lower)
   defp pieces_to_hashes(<<>>, acc), do: acc |> Enum.reverse() |> Enum.join("\n")
