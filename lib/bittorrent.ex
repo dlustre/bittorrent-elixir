@@ -1,4 +1,6 @@
 defmodule Bittorrent.CLI do
+  # @peer_id "165.232.35.114:51437"
+
   def main(argv) do
     case argv do
       ["decode" | [encoded_str | _]] ->
@@ -13,7 +15,7 @@ defmodule Bittorrent.CLI do
           |> Bencode.encode()
           |> hash_sha1()
 
-        <<first::size(20)-unit(8)-binary, _::binary>> = metainfo["info"]["pieces"]
+        <<first::20-unit(8)-binary, _::binary>> = metainfo["info"]["pieces"]
 
         IO.inspect(first |> binary_to_hex())
         IO.inspect(byte_size(first))
@@ -49,6 +51,41 @@ defmodule Bittorrent.CLI do
 
         parse_peers(decoded_body["peers"], [])
         |> Enum.map(&IO.puts/1)
+
+      ["handshake", file_name, ip_and_port] ->
+        if !String.contains?(ip_and_port, ":"),
+          do: raise("Expected ':' in string in #{ip_and_port}")
+
+        metainfo = file_to_metainfo(file_name)
+
+        info_hash =
+          metainfo["info"]
+          |> Bencode.encode()
+          |> hash_sha1()
+
+        [ip, port] = String.split(ip_and_port, ":")
+
+        {:ok, socket} =
+          :gen_tcp.connect(ip |> to_charlist(), port |> String.to_integer(), [
+            :binary,
+            active: true
+          ])
+
+        msg =
+          <<19, "BitTorrent protocol", 0::8-unit(8), info_hash::binary, "definitely_a_peer_id">>
+
+        :ok = :gen_tcp.send(socket, msg)
+
+        receive do
+          {:tcp, ^socket, data} ->
+            <<19, "BitTorrent protocol", 0::8-unit(8), _peer_info_hash::20-unit(8),
+              peer_id::20-unit(8)-binary>> = data
+
+            IO.puts("Peer ID: #{peer_id |> binary_to_hex()}")
+
+          {:tcp_closed, ^socket} ->
+            IO.puts("CLOSED")
+        end
 
       [command | _] ->
         IO.puts("Unknown command: #{command}")
