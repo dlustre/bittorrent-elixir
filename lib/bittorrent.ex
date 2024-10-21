@@ -7,6 +7,8 @@ defmodule Bittorrent.CLI do
 
   @sixteen_kiB 16 * 1024
 
+  # @type block() :: {Integer.t(), Integer.t(), Integer.t()}
+
   def main(argv) do
     case argv do
       ["decode" | [encoded_str | _]] ->
@@ -93,6 +95,7 @@ defmodule Bittorrent.CLI do
         meta = file_to_meta(file_name)
         info_hash = meta_to_info_hash(meta)
         peer_address = meta_to_peers(meta) |> List.first()
+        # peer_addresses = meta_to_peers(meta)
 
         info(meta, info_hash)
 
@@ -107,14 +110,8 @@ defmodule Bittorrent.CLI do
         handshake(socket, msg)
 
         receive_msg(socket, @bitfield)
-        IO.puts("Received bitfield message.")
-
         :gen_tcp.send(socket, <<1::4*8, @interested>>)
-        IO.puts("Sent 'interested' message.")
-
-        IO.puts("Awaiting unchoke message...")
         receive_msg(socket, @unchoke)
-        IO.puts("Received unchoke message.")
 
         file_data =
           piece_lengths(meta["info"]["length"], meta["info"]["piece length"], [])
@@ -150,17 +147,48 @@ defmodule Bittorrent.CLI do
     end
   end
 
+  defp start_worker_pool(socket) do
+    {:ok, pool} =
+      :poolboy.start_link(
+        [worker_module: Bittorrent.CLI.BlockWorker, size: 5, max_overflow: 0],
+        socket
+      )
+
+    pool
+  end
+
+  defmodule BlockWorker do
+    use GenServer
+
+    def start_link(init_arg), do: GenServer.start_link(__MODULE__, init_arg)
+
+    def init(socket), do: {:ok, socket}
+
+    def handle_call({:download_block, block}, _from, socket) do
+      IO.puts("process #{inspect(self())} downloading block")
+      result = Bittorrent.CLI.fetch_block(socket, block)
+      {:reply, result, socket}
+    end
+  end
+
   defp check_hash(actual, expected),
     do: if(actual != expected, do: raise("Hash doesn't match."), else: :ok)
 
-  defp fetch_piece(socket, index, piece_length),
-    do:
-      piece_to_blocks(index, piece_length, 0, [])
-      |> IO.inspect(label: "blocks")
-      |> Enum.map(&fetch_block(socket, &1))
-      # |> IO.inspect(label: "block data received")
-      |> Enum.map(fn {_index, _begin, _length, block} -> block end)
-      |> IO.iodata_to_binary()
+  defp fetch_piece(socket, index, piece_length) do
+    pool = start_worker_pool(socket)
+
+    piece_to_blocks(index, piece_length, 0, [])
+    # |> IO.inspect(label: "blocks")
+    |> Enum.map(fn block ->
+      :poolboy.transaction(
+        pool,
+        &GenServer.call(&1, {:download_block, block})
+      )
+    end)
+    # |> IO.inspect(label: "block data received")
+    |> Enum.map(fn {_index, _begin, _length, block} -> block end)
+    |> IO.iodata_to_binary()
+  end
 
   defp info(meta, info_hash) do
     IO.puts("Tracker URL: #{meta["announce"]}")
@@ -173,15 +201,18 @@ defmodule Bittorrent.CLI do
     |> Enum.map(&IO.puts/1)
   end
 
-  defp fetch_block(socket, {index, begin, length}) do
+  # @spec fetch_block(:gen_tcp.socket(), block()) :: {}
+  def fetch_block(socket, {index, begin, length}) do
     msg_length = 1 + 4 + 4 + 4
 
     :ok =
       :gen_tcp.send(socket, <<msg_length::4*8, @request, index::4*8, begin::4*8, length::4*8>>)
 
-    <<^index::4*8, ^begin::4*8, block::size(length)-unit(8)-binary>> = receive_msg(socket, @piece)
-    IO.inspect(byte_size(block), label: "Block size")
-    {index, begin, length, block}
+    <<^index::4*8, ^begin::4*8, block_data::size(length)-unit(8)-binary>> =
+      receive_msg(socket, @piece)
+
+    IO.inspect(byte_size(block_data), label: "Block size")
+    {index, begin, length, block_data}
   end
 
   defp receive_msg(socket, msg_id) do
