@@ -66,19 +66,13 @@ defmodule Bittorrent.CLI do
         receive_msg(socket, @unchoke)
         IO.puts("Received unchoke message.")
 
-        first_length =
+        piece_length =
           piece_lengths(meta["info"]["length"], meta["info"]["piece length"], [])
           |> IO.inspect(label: "Piece lengths")
           |> Enum.at(index)
           |> IO.inspect(label: "piece #{index} length")
 
-        piece_data =
-          piece_to_blocks(index, first_length, 0, [])
-          |> IO.inspect(label: "blocks")
-          |> Enum.map(&request_block_data(socket, &1))
-          |> IO.inspect(label: "block data received")
-          |> Enum.map(fn {_index, _begin, _length, block} -> block end)
-          |> IO.iodata_to_binary()
+        piece_data = fetch_piece(socket, index, piece_length)
 
         IO.inspect(byte_size(piece_data), label: "combined piece size")
 
@@ -88,11 +82,63 @@ defmodule Bittorrent.CLI do
           label: "expected hash"
         )
 
-        if hash_sha1(piece_data) |> binary_to_hex() !=
-             pieces_to_hashes(meta["info"]["pieces"], []) |> Enum.at(index),
-           do: raise("Hash doesn't match.")
+        check_hash(
+          hash_sha1(piece_data) |> binary_to_hex(),
+          pieces_to_hashes(meta["info"]["pieces"], []) |> Enum.at(index)
+        )
 
         :ok = File.write!(out_path, piece_data, [])
+
+      ["download", "-o", out_path, file_name] ->
+        meta = file_to_meta(file_name)
+        info_hash = meta_to_info_hash(meta)
+        peer_address = meta_to_peers(meta) |> List.first()
+
+        info(meta, info_hash)
+
+        IO.puts("using peer address: " <> peer_address)
+
+        {ip, port} = split_ip_str(peer_address)
+        {:ok, socket} = connect(ip, port)
+
+        msg =
+          <<19, "BitTorrent protocol", 0::8*8, info_hash::binary, "definitely_a_peer_id">>
+
+        handshake(socket, msg)
+
+        receive_msg(socket, @bitfield)
+        IO.puts("Received bitfield message.")
+
+        :gen_tcp.send(socket, <<1::4*8, @interested>>)
+        IO.puts("Sent 'interested' message.")
+
+        IO.puts("Awaiting unchoke message...")
+        receive_msg(socket, @unchoke)
+        IO.puts("Received unchoke message.")
+
+        file_data =
+          piece_lengths(meta["info"]["length"], meta["info"]["piece length"], [])
+          |> IO.inspect(label: "Piece lengths")
+          |> Enum.with_index()
+          |> Enum.map(fn {piece_length, index} ->
+            piece_data = fetch_piece(socket, index, piece_length)
+
+            check_hash(
+              hash_sha1(piece_data) |> binary_to_hex(),
+              pieces_to_hashes(meta["info"]["pieces"], []) |> Enum.at(index)
+            )
+
+            piece_data
+          end)
+          |> IO.iodata_to_binary()
+
+        IO.inspect(byte_size(file_data),
+          label: "Resulting file size (Expected: #{meta["info"]["length"]})"
+        )
+
+        {:ok, file} = File.open(out_path, [:write])
+        :ok = IO.binwrite(file, file_data)
+        File.close(file)
 
       [command | _] ->
         IO.puts("Unknown command: #{command}")
@@ -103,6 +149,18 @@ defmodule Bittorrent.CLI do
         System.halt(1)
     end
   end
+
+  defp check_hash(actual, expected),
+    do: if(actual != expected, do: raise("Hash doesn't match."), else: :ok)
+
+  defp fetch_piece(socket, index, piece_length),
+    do:
+      piece_to_blocks(index, piece_length, 0, [])
+      |> IO.inspect(label: "blocks")
+      |> Enum.map(&fetch_block(socket, &1))
+      # |> IO.inspect(label: "block data received")
+      |> Enum.map(fn {_index, _begin, _length, block} -> block end)
+      |> IO.iodata_to_binary()
 
   defp info(meta, info_hash) do
     IO.puts("Tracker URL: #{meta["announce"]}")
@@ -115,7 +173,7 @@ defmodule Bittorrent.CLI do
     |> Enum.map(&IO.puts/1)
   end
 
-  defp request_block_data(socket, {index, begin, length}) do
+  defp fetch_block(socket, {index, begin, length}) do
     msg_length = 1 + 4 + 4 + 4
 
     :ok =
@@ -131,7 +189,7 @@ defmodule Bittorrent.CLI do
       :gen_tcp.recv(socket, 5)
 
     payload_length = msg_length - 1
-    IO.inspect(payload_length, label: "payload_length")
+    # IO.inspect(payload_length, label: "payload_length")
 
     case payload_length do
       0 ->
@@ -141,7 +199,8 @@ defmodule Bittorrent.CLI do
         {:ok, <<payload::size(length)-unit(8)-binary>>} =
           :gen_tcp.recv(socket, length)
 
-        payload |> IO.inspect(label: "Payload received")
+        payload
+        # |> IO.inspect(label: "Payload received")
     end
   end
 
