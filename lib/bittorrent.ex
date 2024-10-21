@@ -1,5 +1,11 @@
 defmodule Bittorrent.CLI do
-  # @peer_id "165.232.35.114:51437"
+  @unchoke 1
+  @interested 2
+  @bitfield 5
+  @request 6
+  @piece 7
+
+  @sixteen_kiB 16 * 1024
 
   def main(argv) do
     case argv do
@@ -8,84 +14,85 @@ defmodule Bittorrent.CLI do
         IO.puts(Jason.encode!(decoded_str))
 
       ["info" | [file_name | _]] ->
-        metainfo = file_to_metainfo(file_name)
+        meta = file_to_meta(file_name)
+        info_hash = meta_to_info_hash(meta)
 
-        info_hash =
-          metainfo["info"]
-          |> Bencode.encode()
-          |> hash_sha1()
-
-        <<first::20-unit(8)-binary, _::binary>> = metainfo["info"]["pieces"]
-
-        IO.inspect(first |> binary_to_hex())
-        IO.inspect(byte_size(first))
-
-        IO.puts("Tracker URL: #{metainfo["announce"]}")
-        IO.puts("Length: #{metainfo["info"]["length"]}")
-        IO.puts("Info Hash: #{info_hash |> binary_to_hex()}")
-        IO.puts("Piece Length: #{metainfo["info"]["piece length"]}")
-        IO.puts("Piece Hashes:\n#{pieces_to_hashes(metainfo["info"]["pieces"], [])}")
+        info(meta, info_hash)
 
       ["peers" | [file_name | _]] ->
-        metainfo = file_to_metainfo(file_name)
-
-        info_hash =
-          metainfo["info"]
-          |> Bencode.encode()
-          |> hash_sha1()
-
-        body =
-          Req.get!(metainfo["announce"],
-            params: [
-              info_hash: info_hash,
-              peer_id: "definitely_a_peer_id",
-              port: 6881,
-              uploaded: 0,
-              downloaded: 0,
-              left: metainfo["info"]["length"],
-              compact: 1
-            ]
-          ).body
-
-        decoded_body = Bencode.decode(body)
-
-        parse_peers(decoded_body["peers"], [])
+        file_name
+        |> file_to_meta()
+        |> meta_to_peers()
         |> Enum.map(&IO.puts/1)
 
       ["handshake", file_name, ip_and_port] ->
-        if !String.contains?(ip_and_port, ":"),
-          do: raise("Expected ':' in string in #{ip_and_port}")
+        meta = file_to_meta(file_name)
+        info_hash = meta_to_info_hash(meta)
 
-        metainfo = file_to_metainfo(file_name)
-
-        info_hash =
-          metainfo["info"]
-          |> Bencode.encode()
-          |> hash_sha1()
-
-        [ip, port] = String.split(ip_and_port, ":")
-
-        {:ok, socket} =
-          :gen_tcp.connect(ip |> to_charlist(), port |> String.to_integer(), [
-            :binary,
-            active: true
-          ])
+        {ip, port} = split_ip_str(ip_and_port)
+        {:ok, socket} = connect(ip, port)
 
         msg =
-          <<19, "BitTorrent protocol", 0::8-unit(8), info_hash::binary, "definitely_a_peer_id">>
+          <<19, "BitTorrent protocol", 0::8*8, info_hash::binary, "definitely_a_peer_id">>
 
-        :ok = :gen_tcp.send(socket, msg)
+        handshake(socket, msg)
 
-        receive do
-          {:tcp, ^socket, data} ->
-            <<19, "BitTorrent protocol", 0::8-unit(8), _peer_info_hash::20-unit(8),
-              peer_id::20-unit(8)-binary>> = data
+      ["download_piece", "-o", out_path, file_name, index_str] ->
+        index = String.to_integer(index_str)
 
-            IO.puts("Peer ID: #{peer_id |> binary_to_hex()}")
+        meta = file_to_meta(file_name)
+        info_hash = meta_to_info_hash(meta)
+        peer_address = meta_to_peers(meta) |> List.first()
 
-          {:tcp_closed, ^socket} ->
-            IO.puts("CLOSED")
-        end
+        info(meta, info_hash)
+
+        IO.puts("using peer address: " <> peer_address)
+
+        {ip, port} = split_ip_str(peer_address)
+        {:ok, socket} = connect(ip, port)
+
+        msg =
+          <<19, "BitTorrent protocol", 0::8*8, info_hash::binary, "definitely_a_peer_id">>
+
+        handshake(socket, msg)
+
+        receive_msg(socket, @bitfield)
+        IO.puts("Received bitfield message.")
+
+        :gen_tcp.send(socket, <<1::4*8, @interested>>)
+        IO.puts("Sent 'interested' message.")
+
+        IO.puts("Awaiting unchoke message...")
+        receive_msg(socket, @unchoke)
+        IO.puts("Received unchoke message.")
+
+        first_length =
+          piece_lengths(meta["info"]["length"], meta["info"]["piece length"], [])
+          |> IO.inspect(label: "Piece lengths")
+          |> Enum.at(index)
+          |> IO.inspect(label: "piece #{index} length")
+
+        piece_data =
+          piece_to_blocks(index, first_length, 0, [])
+          |> IO.inspect(label: "blocks")
+          |> Enum.map(&request_block_data(socket, &1))
+          |> IO.inspect(label: "block data received")
+          |> Enum.map(fn {_index, _begin, _length, block} -> block end)
+          |> IO.iodata_to_binary()
+
+        IO.inspect(byte_size(piece_data), label: "combined piece size")
+
+        IO.inspect(hash_sha1(piece_data) |> binary_to_hex(), label: "resulting hash")
+
+        IO.inspect(pieces_to_hashes(meta["info"]["pieces"], []) |> Enum.at(index),
+          label: "expected hash"
+        )
+
+        if hash_sha1(piece_data) |> binary_to_hex() !=
+             pieces_to_hashes(meta["info"]["pieces"], []) |> Enum.at(index),
+           do: raise("Hash doesn't match.")
+
+        :ok = File.write!(out_path, piece_data, [])
 
       [command | _] ->
         IO.puts("Unknown command: #{command}")
@@ -97,6 +104,103 @@ defmodule Bittorrent.CLI do
     end
   end
 
+  defp info(meta, info_hash) do
+    IO.puts("Tracker URL: #{meta["announce"]}")
+    IO.puts("Length: #{meta["info"]["length"]}")
+    IO.puts("Info Hash: #{info_hash |> binary_to_hex()}")
+    IO.puts("Piece Length: #{meta["info"]["piece length"]}")
+    IO.puts("Piece Hashes:")
+
+    pieces_to_hashes(meta["info"]["pieces"], [])
+    |> Enum.map(&IO.puts/1)
+  end
+
+  defp request_block_data(socket, {index, begin, length}) do
+    msg_length = 1 + 4 + 4 + 4
+
+    :ok =
+      :gen_tcp.send(socket, <<msg_length::4*8, @request, index::4*8, begin::4*8, length::4*8>>)
+
+    <<^index::4*8, ^begin::4*8, block::size(length)-unit(8)-binary>> = receive_msg(socket, @piece)
+    IO.inspect(byte_size(block), label: "Block size")
+    {index, begin, length, block}
+  end
+
+  defp receive_msg(socket, msg_id) do
+    {:ok, <<msg_length::4*8, ^msg_id>>} =
+      :gen_tcp.recv(socket, 5)
+
+    payload_length = msg_length - 1
+    IO.inspect(payload_length, label: "payload_length")
+
+    case payload_length do
+      0 ->
+        nil
+
+      length ->
+        {:ok, <<payload::size(length)-unit(8)-binary>>} =
+          :gen_tcp.recv(socket, length)
+
+        payload |> IO.inspect(label: "Payload received")
+    end
+  end
+
+  defp piece_lengths(file_length, piece_length, acc) when file_length <= piece_length,
+    do: [file_length | acc] |> Enum.reverse()
+
+  defp piece_lengths(file_length, piece_length, acc),
+    do: piece_lengths(file_length - piece_length, piece_length, [piece_length | acc])
+
+  defp piece_to_blocks(index, piece_length, begin, acc) when piece_length <= @sixteen_kiB,
+    do: [{index, begin * @sixteen_kiB, piece_length} | acc] |> Enum.reverse()
+
+  defp piece_to_blocks(index, piece_length, begin, acc),
+    do:
+      piece_to_blocks(index, piece_length - @sixteen_kiB, begin + 1, [
+        {index, begin * @sixteen_kiB, @sixteen_kiB} | acc
+      ])
+
+  defp meta_to_peers(meta),
+    do:
+      (Req.get!(meta["announce"],
+         params: [
+           info_hash: meta_to_info_hash(meta),
+           peer_id: "definitely_a_peer_id",
+           port: 6881,
+           uploaded: 0,
+           downloaded: 0,
+           left: meta["info"]["length"],
+           compact: 1
+         ]
+       ).body
+       |> Bencode.decode())["peers"]
+      |> parse_peers([])
+
+  defp meta_to_info_hash(meta),
+    do:
+      meta["info"]
+      |> Bencode.encode()
+      |> hash_sha1()
+
+  defp connect(ip, port),
+    do:
+      :gen_tcp.connect(to_charlist(ip), String.to_integer(port), [
+        :binary,
+        active: false
+      ])
+
+  defp handshake(socket, msg) do
+    :ok = :gen_tcp.send(socket, msg)
+
+    {:ok,
+     <<19, "BitTorrent protocol", _reserved::8*8, _peer_info_hash::20*8, peer_id::20*8-binary>>} =
+      :gen_tcp.recv(socket, 68)
+
+    IO.puts("Peer ID: #{peer_id |> binary_to_hex()}")
+
+    socket
+  end
+
   defp parse_peers(<<>>, acc), do: acc
 
   defp parse_peers(<<a::8, b::8, c::8, d::8, port::16, rest::binary>>, acc),
@@ -106,101 +210,20 @@ defmodule Bittorrent.CLI do
         [([a, b, c, d] |> Enum.join(".")) <> ":#{port}" | acc]
       )
 
-  defp file_to_metainfo(path), do: File.read!(path) |> Bencode.decode()
+  defp split_ip_str(ip_str) do
+    if !String.contains?(ip_str, ":"),
+      do: raise("Expected ':' in string in #{ip_str}")
+
+    [ip, port] = String.split(ip_str, ":")
+    {ip, port}
+  end
+
+  defp file_to_meta(path), do: File.read!(path) |> Bencode.decode()
   defp hash_sha1(data), do: :crypto.hash(:sha, data)
   defp binary_to_hex(binary), do: Base.encode16(binary, case: :lower)
-  defp pieces_to_hashes(<<>>, acc), do: acc |> Enum.reverse() |> Enum.join("\n")
 
-  defp pieces_to_hashes(<<piece::20-unit(8)-binary, rest::binary>>, acc),
+  defp pieces_to_hashes(<<>>, acc), do: acc |> Enum.reverse()
+
+  defp pieces_to_hashes(<<piece::20*8-binary, rest::binary>>, acc),
     do: pieces_to_hashes(rest, [binary_to_hex(piece) | acc])
-end
-
-defmodule Bencode do
-  def encode(dict) when is_map(dict) do
-    encoded_dict =
-      dict
-      |> Map.to_list()
-      |> Enum.sort()
-      |> Enum.map(fn {key, value} -> encode(key) <> encode(value) end)
-      # |> IO.inspect(label: "after map")
-      |> Enum.join()
-
-    "d" <> encoded_dict <> "e"
-  end
-
-  def encode(list) when is_list(list) do
-    encoded = Enum.map(list, &encode/1) |> Enum.join()
-    "l#{encoded}e"
-  end
-
-  def encode(int) when is_integer(int), do: "i#{int}e"
-
-  def encode(string) when is_binary(string),
-    do: "#{byte_size(string)}:" <> string
-
-  def decode(encoded_value) when is_binary(encoded_value) do
-    {result, _} = parse(encoded_value)
-    result
-  end
-
-  def decode(_), do: "Invalid encoded value: not binary"
-
-  def parse(<<?d, dict::binary>>),
-    do:
-      dict
-      # |> IO.inspect(label: "dict")
-      |> parse_dict(%{})
-
-  def parse(<<?l, list::binary>>),
-    do:
-      list
-      # |> IO.inspect(label: "list")
-      |> parse_list([])
-
-  def parse(<<?i, int::binary>>),
-    do:
-      int
-      # |> IO.inspect(label: "int")
-      |> parse_int([])
-
-  def parse(string) when is_binary(string) do
-    if :binary.match(string, <<?:>>) == :nomatch,
-      do: raise("Expected ':' in string in #{string}")
-
-    [length_str, string] = :binary.split(string, ":")
-    size = String.to_integer(length_str)
-    <<string::size(size)-unit(8)-binary, rest::binary>> = string
-
-    {string, rest}
-    # |> IO.inspect(label: "Parsed string and rest")
-  end
-
-  def parse_int(<<?e, rest::binary>>, acc), do: {acc |> Enum.reverse() |> List.to_integer(), rest}
-  def parse_int(<<character, rest::binary>>, acc), do: parse_int(rest, [character | acc])
-
-  def parse_list(<<?e, rest::binary>>, acc), do: {acc |> Enum.reverse(), rest}
-
-  def parse_list(list, acc) do
-    {result, rest} = parse(list)
-    parse_list(rest, [result | acc])
-  end
-
-  def parse_dict(<<?e, rest::binary>>, map), do: {map, rest}
-
-  def parse_dict(dict, map) do
-    {key, rest} =
-      dict
-      # |> IO.inspect(label: "Parsing as key")
-      |> parse()
-
-    {value, rest} =
-      rest
-      # |> IO.inspect(label: "Parsing as value")
-      |> parse()
-
-    # IO.puts("Finished kv pair.")
-    if byte_size(rest) == 0, do: raise("Unexpected 0 bytes during dict parsing.")
-
-    parse_dict(rest, map |> Map.put(key, value))
-  end
 end
