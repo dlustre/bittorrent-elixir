@@ -4,6 +4,7 @@ defmodule Bittorrent.CLI do
   @bitfield 5
   @request 6
   @piece 7
+  @extension 20
 
   @sixteen_kiB 16 * 1024
   @extension_support <<0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00>>
@@ -174,7 +175,30 @@ defmodule Bittorrent.CLI do
           <<19, "BitTorrent protocol", @extension_support, info_hash::binary,
             "definitely_a_peer_id">>
 
-        handshake(socket, msg)
+        reserved = handshake(socket, msg)
+        receive_msg(socket, @bitfield)
+
+        case reserved do
+          <<_::5*8, 0x10, _::2*8>> ->
+            bencoded_dict =
+              Bencode.encode(%{
+                "m" => %{
+                  "ut_metadata" => 1
+                }
+              })
+
+            payload =
+              <<0, bencoded_dict::binary>>
+
+            msg_length = 1 + byte_size(payload)
+            extension_msg = <<msg_length::4*8, @extension, payload::binary>>
+
+            :ok = :gen_tcp.send(socket, extension_msg)
+            receive_msg(socket, @extension)
+
+          _ ->
+            nil
+        end
 
       [command | _] ->
         IO.puts("Unknown command: #{command}")
@@ -340,12 +364,13 @@ defmodule Bittorrent.CLI do
     :ok = :gen_tcp.send(socket, msg)
 
     {:ok,
-     <<19, "BitTorrent protocol", _reserved::8*8, _peer_info_hash::20*8, peer_id::20*8-binary>>} =
+     <<19, "BitTorrent protocol", reserved::8*8-binary, _peer_info_hash::20*8,
+       peer_id::20*8-binary>>} =
       :gen_tcp.recv(socket, 68)
 
     IO.puts("Peer ID: #{peer_id |> binary_to_hex()}")
 
-    socket
+    reserved
   end
 
   defp parse_peers(<<>>, acc), do: acc
