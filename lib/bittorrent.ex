@@ -259,6 +259,74 @@ defmodule Bittorrent.CLI do
 
         :ok = File.write!(out_path, piece_data, [])
 
+      ["magnet_download", "-o", out_path, link] ->
+        %{
+          "tr" => tracker_url,
+          "xt" => "urn:btih:" <> info_hash_hex
+        } = parse_magnet_link(link)
+
+        info_hash = Base.decode16!(info_hash_hex, case: :lower)
+
+        [peer | _] = peers(tracker_url, info_hash)
+
+        {ip, port} = split_ip_str(peer)
+        {:ok, socket} = connect(ip, port)
+
+        msg =
+          <<19, "BitTorrent protocol", @extension_support, info_hash::binary,
+            "definitely_a_peer_id">>
+
+        reserved = handshake(socket, msg)
+        receive_msg(socket, @bitfield)
+        peer_extension_id = reserved_handler(reserved, socket)
+
+        request_dict = %{"msg_type" => 0, "piece" => 0} |> Bencode.encode()
+        request_payload = <<peer_extension_id, request_dict::binary>>
+        request_msg_length = 1 + byte_size(request_payload)
+        request_msg = <<request_msg_length::4*8, @extension, request_payload::binary>>
+
+        :ok = :gen_tcp.send(socket, request_msg)
+
+        <<@data_extension_msg, data_payload::binary>> =
+          receive_msg(socket, @extension) |> IO.inspect(label: "data payload received")
+
+        {%{
+           "msg_type" => @data_extension_msg,
+           "piece" => 0,
+           "total_size" => _total_size
+         },
+         bencoded_meta_info} =
+          Bencode.decode(data_payload, :has_more) |> IO.inspect(label: "decoded data dict")
+
+        meta_info = Bencode.decode(bencoded_meta_info)
+
+        info(
+          meta_info,
+          hash_sha1(bencoded_meta_info),
+          tracker_url
+        )
+
+        :ok = :gen_tcp.send(socket, <<1::4*8, @interested>>)
+        receive_msg(socket, @unchoke)
+
+        file_data =
+          piece_lengths(meta_info["length"], meta_info["piece length"], [])
+          |> Enum.with_index()
+          |> IO.inspect(label: "piece lengths")
+          |> Enum.map(fn {piece_length, index} ->
+            piece_data = fetch_piece(socket, index, piece_length)
+
+            check_hash(
+              hash_sha1(piece_data) |> binary_to_hex(),
+              pieces_to_hashes(meta_info["pieces"], []) |> Enum.at(index)
+            )
+
+            piece_data
+          end)
+          |> IO.iodata_to_binary()
+
+        :ok = File.write!(out_path, file_data, [])
+
       [command | _] ->
         IO.puts("Unknown command: #{command}")
         System.halt(1)
