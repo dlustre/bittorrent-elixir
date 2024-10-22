@@ -6,6 +6,8 @@ defmodule Bittorrent.CLI do
   @piece 7
 
   @sixteen_kiB 16 * 1024
+  @extension_support <<0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00>>
+  @unknown_left 999
 
   # @type block() :: {Integer.t(), Integer.t(), Integer.t()}
 
@@ -154,6 +156,26 @@ defmodule Bittorrent.CLI do
         IO.puts("Tracker URL: #{Map.get(query_params, "tr")}")
         IO.puts("Info Hash: #{info_hash}")
 
+      ["magnet_handshake" | [link | _]] ->
+        "magnet:?" <> query = link
+        query_params = URI.decode_query(query)
+        tracker_url = Map.get(query_params, "tr")
+        "urn:btih:" <> info_hash_hex = Map.get(query_params, "xt")
+        info_hash = Base.decode16!(info_hash_hex, case: :lower)
+
+        [peer | _] =
+          peers(tracker_url, info_hash)
+          |> IO.inspect(label: "peers discovered")
+
+        {ip, port} = split_ip_str(peer)
+        {:ok, socket} = connect(ip, port)
+
+        msg =
+          <<19, "BitTorrent protocol", @extension_support, info_hash::binary,
+            "definitely_a_peer_id">>
+
+        handshake(socket, msg)
+
       [command | _] ->
         IO.puts("Unknown command: #{command}")
         System.halt(1)
@@ -268,6 +290,22 @@ defmodule Bittorrent.CLI do
       piece_to_blocks(index, piece_length - @sixteen_kiB, begin + 1, [
         {index, begin * @sixteen_kiB, @sixteen_kiB} | acc
       ])
+
+  defp peers(tracker_url, info_hash),
+    do:
+      (Req.get!(tracker_url,
+         params: [
+           info_hash: info_hash,
+           peer_id: "definitely_a_peer_id",
+           port: 6881,
+           uploaded: 0,
+           downloaded: 0,
+           left: @unknown_left,
+           compact: 1
+         ]
+       ).body
+       |> Bencode.decode())["peers"]
+      |> parse_peers([])
 
   defp meta_to_peers(meta),
     do:
