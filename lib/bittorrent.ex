@@ -94,39 +94,44 @@ defmodule Bittorrent.CLI do
       ["download", "-o", out_path, file_name] ->
         meta = file_to_meta(file_name)
         info_hash = meta_to_info_hash(meta)
-        peer_address = meta_to_peers(meta) |> List.first()
-        # peer_addresses = meta_to_peers(meta)
+        peer_addresses = meta_to_peers(meta) |> Enum.map(&split_ip_str/1)
+
+        piece_lengths = piece_lengths(meta["info"]["length"], meta["info"]["piece length"], [])
+        task_assignments = load_balancer(:round_robin, piece_lengths, peer_addresses)
 
         info(meta, info_hash)
-
-        IO.puts("using peer address: " <> peer_address)
-
-        {ip, port} = split_ip_str(peer_address)
-        {:ok, socket} = connect(ip, port)
 
         msg =
           <<19, "BitTorrent protocol", 0::8*8, info_hash::binary, "definitely_a_peer_id">>
 
-        handshake(socket, msg)
-
-        receive_msg(socket, @bitfield)
-        :gen_tcp.send(socket, <<1::4*8, @interested>>)
-        receive_msg(socket, @unchoke)
+        start = :erlang.monotonic_time(:second)
 
         file_data =
-          piece_lengths(meta["info"]["length"], meta["info"]["piece length"], [])
-          |> IO.inspect(label: "Piece lengths")
+          task_assignments
           |> Enum.with_index()
-          |> Enum.map(fn {piece_length, index} ->
-            piece_data = fetch_piece(socket, index, piece_length)
+          |> IO.inspect(label: "Piece assignments")
+          |> Task.async_stream(
+            fn {{piece_length, {ip, port}}, index} ->
+              {:ok, socket} = connect(ip, port)
+              handshake(socket, msg)
+              receive_msg(socket, @bitfield)
+              :gen_tcp.send(socket, <<1::4*8, @interested>>)
+              receive_msg(socket, @unchoke)
 
-            check_hash(
-              hash_sha1(piece_data) |> binary_to_hex(),
-              pieces_to_hashes(meta["info"]["pieces"], []) |> Enum.at(index)
-            )
+              piece_data = fetch_piece(socket, index, piece_length)
 
-            piece_data
-          end)
+              check_hash(
+                hash_sha1(piece_data) |> binary_to_hex(),
+                pieces_to_hashes(meta["info"]["pieces"], []) |> Enum.at(index)
+              )
+
+              piece_data
+            end,
+            ordered: true,
+            max_concurrency: length(peer_addresses)
+          )
+          |> Enum.to_list()
+          |> Enum.map(fn {:ok, piece_data} -> piece_data end)
           |> IO.iodata_to_binary()
 
         IO.inspect(byte_size(file_data),
@@ -137,6 +142,10 @@ defmodule Bittorrent.CLI do
         :ok = IO.binwrite(file, file_data)
         File.close(file)
 
+        elapsed_seconds = :erlang.monotonic_time(:second) - start
+
+        IO.puts("Elapsed time: #{elapsed_seconds} seconds")
+
       [command | _] ->
         IO.puts("Unknown command: #{command}")
         System.halt(1)
@@ -146,6 +155,8 @@ defmodule Bittorrent.CLI do
         System.halt(1)
     end
   end
+
+  defp load_balancer(:round_robin, tasks, workers), do: Enum.zip(tasks, Stream.cycle(workers))
 
   defp start_worker_pool(socket) do
     {:ok, pool} =
