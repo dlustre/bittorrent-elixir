@@ -180,28 +180,45 @@ defmodule Bittorrent.CLI do
 
         case reserved do
           <<_::5*8, 0x10, _::2*8>> ->
-            bencoded_dict =
-              Bencode.encode(%{
-                "m" => %{
-                  "ut_metadata" => 1
-                }
-              })
+            extension_handshake(socket)
 
-            payload =
-              <<0, bencoded_dict::binary>>
+          _ ->
+            nil
+        end
 
-            msg_length = 1 + byte_size(payload)
-            extension_msg = <<msg_length::4*8, @extension, payload::binary>>
+      ["magnet_info" | [link | _]] ->
+        "magnet:?" <> query = link
+        query_params = URI.decode_query(query)
+        tracker_url = Map.get(query_params, "tr")
+        "urn:btih:" <> info_hash_hex = Map.get(query_params, "xt")
+        info_hash = Base.decode16!(info_hash_hex, case: :lower)
 
-            :ok = :gen_tcp.send(socket, extension_msg)
+        [peer | _] =
+          peers(tracker_url, info_hash)
+          |> IO.inspect(label: "peers discovered")
 
-            <<0, received_dict::binary>> =
-              receive_msg(socket, @extension) |> IO.inspect(label: "extension payload received")
+        {ip, port} = split_ip_str(peer)
+        {:ok, socket} = connect(ip, port)
 
-            decoded_dict = Bencode.decode(received_dict)
+        msg =
+          <<19, "BitTorrent protocol", @extension_support, info_hash::binary,
+            "definitely_a_peer_id">>
 
-            peer_extension_id = Map.get(decoded_dict, "m") |> Map.get("ut_metadata")
-            IO.puts("Peer Metadata Extension ID: #{peer_extension_id}")
+        reserved = handshake(socket, msg)
+        receive_msg(socket, @bitfield)
+
+        case reserved do
+          <<_::5*8, 0x10, _::2*8>> ->
+            peer_extension_id = extension_handshake(socket)
+
+            bencoded_dict = %{"msg_type" => 0, "piece" => 0} |> Bencode.encode()
+
+            request_payload = <<peer_extension_id, bencoded_dict::binary>>
+
+            request_msg_length = 1 + byte_size(request_payload)
+            request_msg = <<request_msg_length::4*8, @extension, request_payload::binary>>
+
+            :ok = :gen_tcp.send(socket, request_msg)
 
           _ ->
             nil
@@ -215,6 +232,27 @@ defmodule Bittorrent.CLI do
         IO.puts("Usage: your_bittorrent.sh <command> <args>")
         System.halt(1)
     end
+  end
+
+  defp extension_handshake(socket) do
+    bencoded_dict = %{"m" => %{"ut_metadata" => 1}} |> Bencode.encode()
+
+    payload =
+      <<0, bencoded_dict::binary>>
+
+    msg_length = 1 + byte_size(payload)
+    extension_msg = <<msg_length::4*8, @extension, payload::binary>>
+
+    :ok = :gen_tcp.send(socket, extension_msg)
+
+    <<0, received_dict::binary>> =
+      receive_msg(socket, @extension) |> IO.inspect(label: "extension payload received")
+
+    decoded_dict = Bencode.decode(received_dict)
+
+    peer_extension_id = Map.get(decoded_dict, "m") |> Map.get("ut_metadata")
+    IO.puts("Peer Metadata Extension ID: #{peer_extension_id}")
+    peer_extension_id
   end
 
   defp load_balancer(:round_robin, tasks, workers), do: Enum.zip(tasks, Stream.cycle(workers))
