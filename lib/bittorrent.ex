@@ -146,6 +146,14 @@ defmodule Bittorrent.CLI do
 
         IO.puts("Elapsed time: #{elapsed_seconds} seconds")
 
+      ["magnet_parse" | [link | _]] ->
+        "magnet:?" <> query = link
+        query_params = URI.decode_query(query)
+        "urn:btih:" <> info_hash = Map.get(query_params, "xt")
+
+        IO.puts("Tracker URL: #{Map.get(query_params, "tr")}")
+        IO.puts("Info Hash: #{info_hash}")
+
       [command | _] ->
         IO.puts("Unknown command: #{command}")
         System.halt(1)
