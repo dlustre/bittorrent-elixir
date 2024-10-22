@@ -11,8 +11,6 @@ defmodule Bittorrent.CLI do
   @extension_support <<0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00>>
   @unknown_left 999
 
-  # @type block() :: {Integer.t(), Integer.t(), Integer.t()}
-
   def main(argv) do
     case argv do
       ["decode" | [encoded_str | _]] ->
@@ -38,8 +36,7 @@ defmodule Bittorrent.CLI do
         {ip, port} = split_ip_str(ip_and_port)
         {:ok, socket} = connect(ip, port)
 
-        msg =
-          <<19, "BitTorrent protocol", 0::8*8, info_hash::binary, "definitely_a_peer_id">>
+        msg = <<19, "BitTorrent protocol", 0::8*8, info_hash::binary, "definitely_a_peer_id">>
 
         handshake(socket, msg)
 
@@ -51,49 +48,25 @@ defmodule Bittorrent.CLI do
         peer_address = meta_to_peers(meta) |> List.first()
 
         info(meta, info_hash)
-
-        IO.puts("using peer address: " <> peer_address)
-
-        {ip, port} = split_ip_str(peer_address)
-        {:ok, socket} = connect(ip, port)
-
-        msg =
-          <<19, "BitTorrent protocol", 0::8*8, info_hash::binary, "definitely_a_peer_id">>
-
-        handshake(socket, msg)
-
-        receive_msg(socket, @bitfield)
-        IO.puts("Received bitfield message.")
-
-        :gen_tcp.send(socket, <<1::4*8, @interested>>)
-        IO.puts("Sent 'interested' message.")
-
-        IO.puts("Awaiting unchoke message...")
-        receive_msg(socket, @unchoke)
-        IO.puts("Received unchoke message.")
+        msg = <<19, "BitTorrent protocol", 0::8*8, info_hash::binary, "definitely_a_peer_id">>
 
         piece_length =
           piece_lengths(meta["info"]["length"], meta["info"]["piece length"], [])
-          |> IO.inspect(label: "Piece lengths")
           |> Enum.at(index)
-          |> IO.inspect(label: "piece #{index} length")
 
-        piece_data = fetch_piece(socket, index, piece_length)
+        {ip, port} = split_ip_str(peer_address)
 
-        IO.inspect(byte_size(piece_data), label: "combined piece size")
+        piece_data =
+          piece_job(
+            ip,
+            port,
+            msg,
+            index,
+            piece_length,
+            pieces_to_hashes(meta["info"]["pieces"], []) |> Enum.at(index)
+          )
 
-        IO.inspect(hash_sha1(piece_data) |> binary_to_hex(), label: "resulting hash")
-
-        IO.inspect(pieces_to_hashes(meta["info"]["pieces"], []) |> Enum.at(index),
-          label: "expected hash"
-        )
-
-        check_hash(
-          hash_sha1(piece_data) |> binary_to_hex(),
-          pieces_to_hashes(meta["info"]["pieces"], []) |> Enum.at(index)
-        )
-
-        :ok = File.write!(out_path, piece_data, [])
+        :ok = File.write!(out_path, piece_data)
 
       ["download", "-o", out_path, file_name] ->
         meta = file_to_meta(file_name)
@@ -116,20 +89,14 @@ defmodule Bittorrent.CLI do
           |> IO.inspect(label: "Piece assignments")
           |> Task.async_stream(
             fn {{piece_length, {ip, port}}, index} ->
-              {:ok, socket} = connect(ip, port)
-              handshake(socket, msg)
-              receive_msg(socket, @bitfield)
-              :gen_tcp.send(socket, <<1::4*8, @interested>>)
-              receive_msg(socket, @unchoke)
-
-              piece_data = fetch_piece(socket, index, piece_length)
-
-              check_hash(
-                hash_sha1(piece_data) |> binary_to_hex(),
+              piece_job(
+                ip,
+                port,
+                msg,
+                index,
+                piece_length,
                 pieces_to_hashes(meta["info"]["pieces"], []) |> Enum.at(index)
               )
-
-              piece_data
             end,
             ordered: true,
             max_concurrency: length(peer_addresses)
@@ -151,23 +118,25 @@ defmodule Bittorrent.CLI do
         IO.puts("Elapsed time: #{elapsed_seconds} seconds")
 
       ["magnet_parse" | [link | _]] ->
-        "magnet:?" <> query = link
-        query_params = URI.decode_query(query)
-        "urn:btih:" <> info_hash = query_params["xt"]
+        %{
+          "tr" => tracker_url,
+          "xt" => "urn:btih:" <> info_hash_hex
+        } = parse_magnet_link(link)
 
-        IO.puts("Tracker URL: #{query_params["tr"]}")
-        IO.puts("Info Hash: #{info_hash}")
+        info_hash = Base.decode16!(info_hash_hex, case: :lower)
+
+        IO.puts("Tracker URL: #{tracker_url}")
+        IO.puts("Info Hash: #{info_hash |> binary_to_hex()}")
 
       ["magnet_handshake" | [link | _]] ->
-        "magnet:?" <> query = link
-        query_params = URI.decode_query(query)
-        tracker_url = query_params["tr"]
-        "urn:btih:" <> info_hash_hex = query_params["xt"]
+        %{
+          "tr" => tracker_url,
+          "xt" => "urn:btih:" <> info_hash_hex
+        } = parse_magnet_link(link)
+
         info_hash = Base.decode16!(info_hash_hex, case: :lower)
 
-        [peer | _] =
-          peers(tracker_url, info_hash)
-          |> IO.inspect(label: "peers discovered")
+        [peer | _] = peers(tracker_url, info_hash)
 
         {ip, port} = split_ip_str(peer)
         {:ok, socket} = connect(ip, port)
@@ -178,25 +147,17 @@ defmodule Bittorrent.CLI do
 
         reserved = handshake(socket, msg)
         receive_msg(socket, @bitfield)
-
-        case reserved do
-          <<_::5*8, 0x10, _::2*8>> ->
-            extension_handshake(socket)
-
-          _ ->
-            nil
-        end
+        reserved_handler(reserved, socket)
 
       ["magnet_info" | [link | _]] ->
-        "magnet:?" <> query = link
-        query_params = URI.decode_query(query)
-        tracker_url = query_params["tr"]
-        "urn:btih:" <> info_hash_hex = query_params["xt"]
+        %{
+          "tr" => tracker_url,
+          "xt" => "urn:btih:" <> info_hash_hex
+        } = parse_magnet_link(link)
+
         info_hash = Base.decode16!(info_hash_hex, case: :lower)
 
-        [peer | _] =
-          peers(tracker_url, info_hash)
-          |> IO.inspect(label: "peers discovered")
+        [peer | _] = peers(tracker_url, info_hash)
 
         {ip, port} = split_ip_str(peer)
         {:ok, socket} = connect(ip, port)
@@ -207,41 +168,96 @@ defmodule Bittorrent.CLI do
 
         reserved = handshake(socket, msg)
         receive_msg(socket, @bitfield)
+        peer_extension_id = reserved_handler(reserved, socket)
 
-        case reserved do
-          <<_::5*8, 0x10, _::2*8>> ->
-            peer_extension_id = extension_handshake(socket)
-            bencoded_dict = %{"msg_type" => 0, "piece" => 0} |> Bencode.encode()
+        request_dict = %{"msg_type" => 0, "piece" => 0} |> Bencode.encode()
+        request_payload = <<peer_extension_id, request_dict::binary>>
+        request_msg_length = 1 + byte_size(request_payload)
+        request_msg = <<request_msg_length::4*8, @extension, request_payload::binary>>
 
-            request_payload = <<peer_extension_id, bencoded_dict::binary>>
+        :ok = :gen_tcp.send(socket, request_msg)
 
-            request_msg_length = 1 + byte_size(request_payload)
-            request_msg = <<request_msg_length::4*8, @extension, request_payload::binary>>
+        <<@data_extension_msg, data_payload::binary>> =
+          receive_msg(socket, @extension) |> IO.inspect(label: "data payload received")
 
-            :ok = :gen_tcp.send(socket, request_msg)
+        {%{
+           "msg_type" => @data_extension_msg,
+           "piece" => 0,
+           "total_size" => _total_size
+         },
+         bencoded_meta_info} =
+          Bencode.decode(data_payload, :has_more) |> IO.inspect(label: "decoded data dict")
 
-            <<@data_extension_msg, data_payload::binary>> =
-              receive_msg(socket, @extension) |> IO.inspect(label: "data payload received")
+        info(
+          Bencode.decode(bencoded_meta_info),
+          hash_sha1(bencoded_meta_info),
+          tracker_url
+        )
 
-            {%{
-               "msg_type" => @data_extension_msg,
-               "piece" => 0,
-               "total_size" => _total_size
-             },
-             bencoded_meta_info} =
-              Bencode.decode(data_payload, :has_more) |> IO.inspect(label: "decoded data dict")
+      ["magnet_download_piece", "-o", out_path, link, index_str] ->
+        index = String.to_integer(index_str)
 
-            meta_info = Bencode.decode(bencoded_meta_info)
+        %{
+          "tr" => tracker_url,
+          "xt" => "urn:btih:" <> info_hash_hex
+        } = parse_magnet_link(link)
 
-            info(
-              meta_info,
-              meta_info |> Bencode.encode() |> hash_sha1(),
-              tracker_url
-            )
+        info_hash = Base.decode16!(info_hash_hex, case: :lower)
 
-          _ ->
-            nil
-        end
+        [peer | _] = peers(tracker_url, info_hash)
+
+        {ip, port} = split_ip_str(peer)
+        {:ok, socket} = connect(ip, port)
+
+        msg =
+          <<19, "BitTorrent protocol", @extension_support, info_hash::binary,
+            "definitely_a_peer_id">>
+
+        reserved = handshake(socket, msg)
+        receive_msg(socket, @bitfield)
+        peer_extension_id = reserved_handler(reserved, socket)
+
+        request_dict = %{"msg_type" => 0, "piece" => 0} |> Bencode.encode()
+        request_payload = <<peer_extension_id, request_dict::binary>>
+        request_msg_length = 1 + byte_size(request_payload)
+        request_msg = <<request_msg_length::4*8, @extension, request_payload::binary>>
+
+        :ok = :gen_tcp.send(socket, request_msg)
+
+        <<@data_extension_msg, data_payload::binary>> =
+          receive_msg(socket, @extension) |> IO.inspect(label: "data payload received")
+
+        {%{
+           "msg_type" => @data_extension_msg,
+           "piece" => 0,
+           "total_size" => _total_size
+         },
+         bencoded_meta_info} =
+          Bencode.decode(data_payload, :has_more) |> IO.inspect(label: "decoded data dict")
+
+        meta_info = Bencode.decode(bencoded_meta_info)
+
+        info(
+          meta_info,
+          hash_sha1(bencoded_meta_info),
+          tracker_url
+        )
+
+        piece_length =
+          piece_lengths(meta_info["length"], meta_info["piece length"], [])
+          |> Enum.at(index)
+
+        :ok = :gen_tcp.send(socket, <<1::4*8, @interested>>)
+        receive_msg(socket, @unchoke)
+
+        piece_data = fetch_piece(socket, index, piece_length)
+
+        check_hash(
+          hash_sha1(piece_data) |> binary_to_hex(),
+          pieces_to_hashes(meta_info["pieces"], []) |> Enum.at(index)
+        )
+
+        :ok = File.write!(out_path, piece_data, [])
 
       [command | _] ->
         IO.puts("Unknown command: #{command}")
@@ -252,6 +268,27 @@ defmodule Bittorrent.CLI do
         System.halt(1)
     end
   end
+
+  defp piece_job(ip, port, msg, index, piece_length, expected_hash) do
+    {:ok, socket} = connect(ip, port)
+    handshake(socket, msg) |> IO.inspect(label: "Finished base handshake")
+    receive_msg(socket, @bitfield)
+    :ok = :gen_tcp.send(socket, <<1::4*8, @interested>>)
+    receive_msg(socket, @unchoke)
+
+    piece_data = fetch_piece(socket, index, piece_length)
+
+    check_hash(
+      hash_sha1(piece_data) |> binary_to_hex(),
+      expected_hash
+    )
+
+    piece_data
+  end
+
+  defp reserved_handler(<<_::5*8, 0x10, _::2*8>>, socket), do: extension_handshake(socket)
+
+  defp parse_magnet_link("magnet:?" <> query), do: URI.decode_query(query)
 
   defp extension_handshake(socket) do
     bencoded_dict = %{"m" => %{"ut_metadata" => 1}} |> Bencode.encode()
@@ -359,7 +396,6 @@ defmodule Bittorrent.CLI do
     |> Enum.map(&IO.puts/1)
   end
 
-  # @spec fetch_block(:gen_tcp.socket(), block()) :: {}
   def fetch_block(socket, {index, begin, length}) do
     msg_length = 1 + 4 + 4 + 4
 
@@ -369,7 +405,7 @@ defmodule Bittorrent.CLI do
     <<^index::4*8, ^begin::4*8, block_data::size(length)-unit(8)-binary>> =
       receive_msg(socket, @piece)
 
-    IO.inspect(byte_size(block_data), label: "Block size")
+    # IO.inspect(byte_size(block_data), label: "Block size")
     {index, begin, length, block_data}
   end
 
