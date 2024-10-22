@@ -5,6 +5,7 @@ defmodule Bittorrent.CLI do
   @request 6
   @piece 7
   @extension 20
+  @data_extension_msg 1
 
   @sixteen_kiB 16 * 1024
   @extension_support <<0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00>>
@@ -152,16 +153,16 @@ defmodule Bittorrent.CLI do
       ["magnet_parse" | [link | _]] ->
         "magnet:?" <> query = link
         query_params = URI.decode_query(query)
-        "urn:btih:" <> info_hash = Map.get(query_params, "xt")
+        "urn:btih:" <> info_hash = query_params["xt"]
 
-        IO.puts("Tracker URL: #{Map.get(query_params, "tr")}")
+        IO.puts("Tracker URL: #{query_params["tr"]}")
         IO.puts("Info Hash: #{info_hash}")
 
       ["magnet_handshake" | [link | _]] ->
         "magnet:?" <> query = link
         query_params = URI.decode_query(query)
-        tracker_url = Map.get(query_params, "tr")
-        "urn:btih:" <> info_hash_hex = Map.get(query_params, "xt")
+        tracker_url = query_params["tr"]
+        "urn:btih:" <> info_hash_hex = query_params["xt"]
         info_hash = Base.decode16!(info_hash_hex, case: :lower)
 
         [peer | _] =
@@ -189,8 +190,8 @@ defmodule Bittorrent.CLI do
       ["magnet_info" | [link | _]] ->
         "magnet:?" <> query = link
         query_params = URI.decode_query(query)
-        tracker_url = Map.get(query_params, "tr")
-        "urn:btih:" <> info_hash_hex = Map.get(query_params, "xt")
+        tracker_url = query_params["tr"]
+        "urn:btih:" <> info_hash_hex = query_params["xt"]
         info_hash = Base.decode16!(info_hash_hex, case: :lower)
 
         [peer | _] =
@@ -210,7 +211,6 @@ defmodule Bittorrent.CLI do
         case reserved do
           <<_::5*8, 0x10, _::2*8>> ->
             peer_extension_id = extension_handshake(socket)
-
             bencoded_dict = %{"msg_type" => 0, "piece" => 0} |> Bencode.encode()
 
             request_payload = <<peer_extension_id, bencoded_dict::binary>>
@@ -219,6 +219,25 @@ defmodule Bittorrent.CLI do
             request_msg = <<request_msg_length::4*8, @extension, request_payload::binary>>
 
             :ok = :gen_tcp.send(socket, request_msg)
+
+            <<@data_extension_msg, data_payload::binary>> =
+              receive_msg(socket, @extension) |> IO.inspect(label: "data payload received")
+
+            {%{
+               "msg_type" => @data_extension_msg,
+               "piece" => 0,
+               "total_size" => _total_size
+             },
+             bencoded_meta_info} =
+              Bencode.decode(data_payload, :has_more) |> IO.inspect(label: "decoded data dict")
+
+            meta_info = Bencode.decode(bencoded_meta_info)
+
+            info(
+              meta_info,
+              meta_info |> Bencode.encode() |> hash_sha1(),
+              tracker_url
+            )
 
           _ ->
             nil
@@ -250,7 +269,7 @@ defmodule Bittorrent.CLI do
 
     decoded_dict = Bencode.decode(received_dict)
 
-    peer_extension_id = Map.get(decoded_dict, "m") |> Map.get("ut_metadata")
+    peer_extension_id = decoded_dict["m"]["ut_metadata"]
     IO.puts("Peer Metadata Extension ID: #{peer_extension_id}")
     peer_extension_id
   end
@@ -300,14 +319,43 @@ defmodule Bittorrent.CLI do
     |> IO.iodata_to_binary()
   end
 
-  defp info(meta, info_hash) do
-    IO.puts("Tracker URL: #{meta["announce"]}")
-    IO.puts("Length: #{meta["info"]["length"]}")
+  defp info(
+         %{
+           "announce" => announce,
+           "info" => %{
+             "length" => length,
+             "piece length" => piece_length,
+             "pieces" => pieces
+           }
+         },
+         info_hash
+       ) do
+    IO.puts("Tracker URL: #{announce}")
+    IO.puts("Length: #{length}")
     IO.puts("Info Hash: #{info_hash |> binary_to_hex()}")
-    IO.puts("Piece Length: #{meta["info"]["piece length"]}")
+    IO.puts("Piece Length: #{piece_length}")
     IO.puts("Piece Hashes:")
 
-    pieces_to_hashes(meta["info"]["pieces"], [])
+    pieces_to_hashes(pieces, [])
+    |> Enum.map(&IO.puts/1)
+  end
+
+  defp info(
+         %{
+           "length" => length,
+           "piece length" => piece_length,
+           "pieces" => pieces
+         },
+         info_hash,
+         announce
+       ) do
+    IO.puts("Tracker URL: #{announce}")
+    IO.puts("Length: #{length}")
+    IO.puts("Info Hash: #{info_hash |> binary_to_hex()}")
+    IO.puts("Piece Length: #{piece_length}")
+    IO.puts("Piece Hashes:")
+
+    pieces_to_hashes(pieces, [])
     |> Enum.map(&IO.puts/1)
   end
 

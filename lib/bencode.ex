@@ -21,6 +21,8 @@ defmodule Bencode do
   def encode(string) when is_binary(string),
     do: "#{byte_size(string)}:" <> string
 
+  def decode(encoded_value, :has_more) when is_binary(encoded_value), do: parse(encoded_value)
+
   def decode(encoded_value) when is_binary(encoded_value) do
     {result, _} = parse(encoded_value)
     result
