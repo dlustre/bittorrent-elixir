@@ -194,7 +194,14 @@ defmodule Bittorrent.CLI do
             extension_msg = <<msg_length::4*8, @extension, payload::binary>>
 
             :ok = :gen_tcp.send(socket, extension_msg)
-            receive_msg(socket, @extension)
+
+            <<0, received_dict::binary>> =
+              receive_msg(socket, @extension) |> IO.inspect(label: "extension payload received")
+
+            decoded_dict = Bencode.decode(received_dict)
+
+            peer_extension_id = Map.get(decoded_dict, "m") |> Map.get("ut_metadata")
+            IO.puts("Peer Metadata Extension ID: #{peer_extension_id}")
 
           _ ->
             nil
