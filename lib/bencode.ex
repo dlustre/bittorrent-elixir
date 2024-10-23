@@ -5,7 +5,6 @@ defmodule Bencode do
       |> Map.to_list()
       |> Enum.sort()
       |> Enum.map(fn {key, value} -> encode(key) <> encode(value) end)
-      # |> IO.inspect(label: "after map")
       |> Enum.join()
 
     "d" <> encoded_dict <> "e"
@@ -30,23 +29,9 @@ defmodule Bencode do
 
   def decode(_), do: "Invalid encoded value: not binary"
 
-  def parse(<<?d, dict::binary>>),
-    do:
-      dict
-      # |> IO.inspect(label: "dict")
-      |> parse_dict(%{})
-
-  def parse(<<?l, list::binary>>),
-    do:
-      list
-      # |> IO.inspect(label: "list")
-      |> parse_list([])
-
-  def parse(<<?i, int::binary>>),
-    do:
-      int
-      # |> IO.inspect(label: "int")
-      |> parse_int([])
+  def parse(<<?d, dict::binary>>), do: dict |> parse_dict(%{})
+  def parse(<<?l, list::binary>>), do: list |> parse_list([])
+  def parse(<<?i, int::binary>>), do: int |> parse_int([])
 
   def parse(string) when is_binary(string) do
     if :binary.match(string, <<?:>>) == :nomatch,
@@ -57,7 +42,6 @@ defmodule Bencode do
     <<string::size(size)-unit(8)-binary, rest::binary>> = string
 
     {string, rest}
-    # |> IO.inspect(label: "Parsed string and rest")
   end
 
   def parse_int(<<?e, rest::binary>>, acc), do: {acc |> Enum.reverse() |> List.to_integer(), rest}
@@ -73,17 +57,9 @@ defmodule Bencode do
   def parse_dict(<<?e, rest::binary>>, map), do: {map, rest}
 
   def parse_dict(dict, map) do
-    {key, rest} =
-      dict
-      # |> IO.inspect(label: "Parsing as key")
-      |> parse()
+    {key, rest} = parse(dict)
+    {value, rest} = parse(rest)
 
-    {value, rest} =
-      rest
-      # |> IO.inspect(label: "Parsing as value")
-      |> parse()
-
-    # IO.puts("Finished kv pair.")
     if byte_size(rest) == 0, do: raise("Unexpected 0 bytes during dict parsing.")
 
     parse_dict(rest, map |> Map.put(key, value))
