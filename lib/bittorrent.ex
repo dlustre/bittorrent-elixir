@@ -98,7 +98,7 @@ defmodule Bittorrent.CLI do
   defmodule BlockWorker do
     use GenServer
 
-    def start_link(init_arg), do: GenServer.start_link(__MODULE__, init_arg)
+    def start_link([socket]), do: GenServer.start_link(__MODULE__, socket)
 
     def init(socket), do: {:ok, socket}
 
@@ -113,7 +113,7 @@ defmodule Bittorrent.CLI do
 
   defp start_worker_pool(socket) do
     {:ok, pool} =
-      :poolboy.start_link([worker_module: BlockWorker, size: 5, max_overflow: 0], socket)
+      :poolboy.start_link([worker_module: BlockWorker, size: 5, max_overflow: 0], [socket])
 
     pool
   end
